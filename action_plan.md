@@ -1,4 +1,4 @@
-# GitHub Issue Resolver AI Agent - Enhanced Deployment Action Plan
+# GitHub Issue Resolver AI Agent - Enhanced Deployment Action Plan with Haystack
 
 ## Deployment Architecture Overview
 
@@ -6,36 +6,29 @@
 GitHub Issue
     ↓ (Webhook + Signature Verification)
 FastAPI Webhook Handler
-    ↓ Publishes event to Redis Streams  ← [Redis OSS]
-         ↘ Celery workers for quick, stateless jobs (labeling, comments) ← [Celery + Redis OSS]
-         ↘ LangGraph agent flow for multi-step LLM logic ← [LangGraph OSS]
-              ↳ Durable long-running steps wrapped in Temporal workflows ← [Temporal OSS]
+    ↓ Publishes event to Haystack Pipeline
+         ↘ Haystack Agent Flow
+              ↳ Intelligent Issue Resolution
                     ↕
-             Cipher Memory Layer (MCP server, self-hosted) ← [Cipher OSS]
-                    ↕
-             Anthropic API (Claude Sonnet)
+             Anthropic Claude / OpenAI
     ↑ OpenTelemetry Tracing
 ```
 
-## Prerequisites and Free Tools
+## Prerequisites and Tools
 
-### Required Tools
-1. **FastAPI**: Web framework for webhook handling
-2. **Redis OSS**: Message queue and caching
-3. **Celery**: Distributed task queue
-4. **LangGraph OSS**: Agent workflow orchestration
-5. **Temporal OSS**: Workflow durability and management
-6. **Cipher OSS**: Memory and context layer
-7. **Anthropic API** (Claude Sonnet): Language model
-8. **OpenTelemetry**: Distributed tracing
-9. **Prometheus**: Metrics collection
-10. **Slowapi**: Rate limiting
+### Haystack-Powered Tools
+1. **Haystack**: AI orchestration framework
+2. **FastAPI**: Web framework for webhook handling
+3. **Redis**: Caching and message queue
+4. **Anthropic API** (Claude): Language model
+5. **OpenTelemetry**: Distributed tracing
+6. **Prometheus**: Metrics collection
 
 ### System Requirements
 - Python 3.11+
-- Docker (recommended for containerization)
+- Docker (recommended)
 - GitHub Personal Access Token
-- Anthropic API Key
+- Anthropic/OpenAI API Key
 - Minimum 4GB RAM, 2 CPU cores
 
 ## Deployment Steps
@@ -46,346 +39,109 @@ FastAPI Webhook Handler
 python3 -m venv venv
 source venv/bin/activate
 
-# Install comprehensive dependencies
+# Install Haystack and related dependencies
 pip install \
-    fastapi uvicorn redis celery \
-    langchain langgraph temporalio \
-    anthropic github pygithub \
+    haystack-ai \
+    fastapi uvicorn redis \
+    anthropic openai github \
     pydantic prometheus_client \
     opentelemetry-api opentelemetry-sdk \
-    slowapi httpx \
-    pytest pytest-asyncio \
-    httpx-oauth
+    httpx
 ```
 
-### 2. Advanced Configuration Management
-Create `config.py`:
+### 2. Haystack Pipeline Configuration
+`haystack_pipeline.py`:
 ```python
-from pydantic import BaseSettings, SecretStr
-from functools import lru_cache
+from haystack import Pipeline
+from haystack.components.retrievers.github import GitHubIssueRetriever
+from haystack.components.generators import OpenAIGenerator
+from haystack.components.agents import Agent
 
-class Settings(BaseSettings):
-    # API Keys
-    ANTHROPIC_API_KEY: SecretStr
-    GITHUB_TOKEN: SecretStr
-    
-    # Service Configurations
-    REDIS_HOST: str = 'localhost'
-    REDIS_PORT: int = 6379
-    TEMPORAL_HOST: str = 'localhost'
-    TEMPORAL_PORT: int = 7233
-    
-    # Security Settings
-    WEBHOOK_SECRET: SecretStr
-    JWT_SECRET: SecretStr
-    
-    # Cipher Memory Configuration
-    CIPHER_MCP_URL: str = 'http://localhost:3000'
-    
-    # Rate Limiting
-    RATE_LIMIT_REQUESTS: int = 100
-    RATE_LIMIT_WINDOW: int = 60  # seconds
-    
-    class Config:
-        env_file = '.env'
-        env_file_encoding = 'utf-8'
-        secrets_dir = '/run/secrets'
+class GitHubIssueResolver:
+    def __init__(self, github_token, ai_api_key):
+        self.retriever = GitHubIssueRetriever(github_token=github_token)
+        self.generator = OpenAIGenerator(api_key=ai_api_key)
+        
+        self.pipeline = Pipeline()
+        self.pipeline.add_component("retriever", self.retriever)
+        self.pipeline.add_component("generator", self.generator)
+        
+        self.pipeline.connect("retriever", "generator")
 
-@lru_cache()
-def get_settings():
-    return Settings()
+    def resolve_issue(self, issue_context):
+        return self.pipeline.run({
+            "retriever": {"query": issue_context},
+            "generator": {"prompt": f"Resolve GitHub issue: {issue_context}"}
+        })
 ```
 
-### 3. Webhook Handler with Enhanced Security
+### 3. Webhook Handler with Haystack Integration
 `main.py`:
 ```python
-import json
-import hmac
-import hashlib
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from redis import Redis
-from celery import Celery
-from temporalio.client import Client as TemporalClient
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.jaeger.thrift import JaegerExporter
-
-# Configuration
-from config import get_settings
-
-# Setup OpenTelemetry Tracing
-trace.set_tracer_provider(TracerProvider())
-jaeger_exporter = JaegerExporter(
-    agent_host_name="localhost",
-    agent_port=6831,
-)
-trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(jaeger_exporter))
-tracer = trace.get_tracer(__name__)
-
-# Rate Limiting
-limiter = Limiter(key_func=get_remote_address)
-settings = get_settings()
+from fastapi import FastAPI, Request
+from haystack_pipeline import GitHubIssueResolver
 
 app = FastAPI()
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
-# Middleware for host validation
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=['localhost', 'your-domain.com'])
-
-# Redis and Celery Initialization
-redis_client = Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT)
-celery_app = Celery('tasks', broker=f'redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}')
-
-@app.post('/webhook/github')
-@limiter.limit(f"{settings.RATE_LIMIT_REQUESTS}/{settings.RATE_LIMIT_WINDOW}")
-async def github_webhook(request: Request):
-    with tracer.start_as_current_span("github_webhook"):
-        # Verify GitHub webhook signature
-        payload_body = await request.body()
-        signature_header = request.headers.get('X-Hub-Signature-256')
-        
-        if not signature_header:
-            raise HTTPException(status_code=403, detail="No signature found")
-        
-        expected_signature = 'sha256=' + hmac.new(
-            settings.WEBHOOK_SECRET.get_secret_value().encode(),
-            payload_body,
-            hashlib.sha256
-        ).hexdigest()
-        
-        if not hmac.compare_digest(expected_signature, signature_header):
-            raise HTTPException(status_code=403, detail="Invalid signature")
-        
-        try:
-            payload = json.loads(payload_body)
-            # Publish to Redis Stream with error handling
-            redis_client.xadd('github_events', {
-                'payload': json.dumps(payload),
-                'timestamp': int(time.time())
-            })
-            
-            # Trigger initial processing tasks
-            celery_app.send_task('tasks.process_github_event', args=[payload])
-            
-            return {"status": "accepted", "message": "Event processed successfully"}
-        
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload")
-        except Exception as e:
-            # Log the error for debugging
-            logger.error(f"Webhook processing error: {e}")
-            raise HTTPException(status_code=500, detail="Internal processing error")
-```
-
-### 4. Advanced Celery Worker with Retry
-`tasks.py`:
-```python
-from celery import Celery
-from celery.exceptions import MaxRetriesExceededError
-from temporalio.workflow import workflow_method
-import time
-
-celery_app = Celery('tasks', broker='redis://localhost:6379')
-celery_app.conf.update(
-    task_acks_late=True,
-    task_retry_policy={
-        'max_retries': 3,
-        'interval_start': 0,
-        'interval_step': 0.2,
-        'interval_max': 0.6,
-    }
+issue_resolver = GitHubIssueResolver(
+    github_token=os.getenv('GITHUB_TOKEN'),
+    ai_api_key=os.getenv('ANTHROPIC_API_KEY')
 )
 
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=5)
-def process_github_event(self, payload):
-    try:
-        # Process event with robust error handling
-        # Example: auto-labeling, initial classification
-        pass
-    except Exception as exc:
-        try:
-            self.retry(exc=exc)
-        except MaxRetriesExceededError:
-            # Log failure, potentially notify admin
-            logger.error(f"Failed to process event after retries: {payload}")
-```
-
-### 5. Enhanced Cipher Memory Layer
-```python
-from typing import Dict, List, Optional
-import time
-import hashlib
-
-class AdvancedCipherMemory:
-    def __init__(self, url: str):
-        self.url = url
-        self.client = httpx.AsyncClient()
+@app.post('/webhook/github')
+async def github_webhook(request: Request):
+    payload = await request.json()
+    issue_context = extract_issue_context(payload)
     
-    async def store_context(self, context: Dict, tags: List[str] = None):
-        """Store context with advanced metadata"""
-        memory = {
-            'id': self._generate_id(context),
-            'content': context,
-            'metadata': {
-                'created_at': time.time(),
-                'tags': tags or [],
-                'source': 'github_webhook'
-            }
-        }
-        await self._send_to_mcp(memory)
-    
-    async def retrieve_similar_context(self, query: str, top_k: int = 5) -> List[Dict]:
-        """Retrieve similar context using semantic search"""
-        payload = {
-            'query': query,
-            'top_k': top_k,
-            'method': 'semantic_search'
-        }
-        response = await self.client.post(f"{self.url}/search", json=payload)
-        return response.json().get('results', [])
-    
-    def _generate_id(self, context: Dict) -> str:
-        """Generate unique ID for context"""
-        content_hash = hashlib.md5(
-            json.dumps(context, sort_keys=True).encode()
-        ).hexdigest()
-        return f"context_{content_hash}"
+    resolution = issue_resolver.resolve_issue(issue_context)
+    return {"resolution": resolution}
 ```
 
-### 6. Docker Compose for Full Environment
-`docker-compose.yml`:
-```yaml
-version: '3.8'
+### 4. Advanced Retrieval and Resolution
+- Semantic document retrieval
+- Context-aware issue parsing
+- Multi-step resolution workflows
+- Flexible agent configuration
 
-services:
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
+## Enhanced Features
+1. **Intelligent Retrieval**
+   - Semantic search across repository
+   - Context-aware issue understanding
 
-  temporal:
-    image: temporalio/auto-setup:latest
-    ports:
-      - "7233:7233"
-    environment:
-      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development.yaml
-    restart: unless-stopped
+2. **Advanced Resolution**
+   - Multi-step problem-solving
+   - Adaptive response generation
 
-  jaeger:
-    image: jaegertracing/all-in-one:latest
-    ports:
-      - "16686:16686"
-      - "6831:6831/udp"
-    restart: unless-stopped
-
-  prometheus:
-    image: prom/prometheus
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-    ports:
-      - "9090:9090"
-    restart: unless-stopped
-
-  agent-cluster:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
-    depends_on:
-      - redis
-      - temporal
-      - jaeger
-    restart: unless-stopped
-
-volumes:
-  redis_data:
-```
-
-### 7. Comprehensive Testing Strategy
-`tests/test_webhook.py`:
-```python
-import pytest
-from httpx import AsyncClient
-from main import app
-
-@pytest.mark.asyncio
-async def test_github_webhook_signature():
-    """Test webhook signature verification"""
-    async with AsyncClient(app=app, base_url="http://test") as ac:
-        # Test invalid signature
-        response = await ac.post(
-            "/webhook/github", 
-            json={"test": "payload"},
-            headers={"X-Hub-Signature-256": "invalid_signature"}
-        )
-        assert response.status_code == 403
-
-@pytest.mark.asyncio
-async def test_rate_limiting():
-    """Verify rate limiting functionality"""
-    # Implement rate limit test
-    pass
-```
-
-## Enhanced Monitoring and Observability
-- OpenTelemetry for distributed tracing
-- Prometheus metrics collection
-- Jaeger for trace visualization
-- Comprehensive logging with structured log formats
+3. **Flexible Architecture**
+   - Modular pipeline components
+   - Easy model and tool swapping
 
 ## Security Enhancements
 - GitHub webhook signature verification
-- Rate limiting with `slowapi`
-- Environment-based configuration management
-- Secrets management using `.env` and `/run/secrets`
+- Secure API key management
+- Comprehensive error handling
 
 ## Performance Optimization
 - Async programming model
-- Efficient Redis Streams usage
-- Celery task retry mechanisms
-- Distributed tracing for performance insights
+- Efficient caching strategies
+- Distributed tracing
 
 ## Deployment Considerations
-- Containerized microservices architecture
-- Scalable design with independent services
-- Easy horizontal scaling capabilities
-
-## Estimated Deployment Time
-- Initial setup: 4-6 hours
-- Configuration and testing: 8-12 hours
-- Performance tuning: 4-6 hours
+- Containerized microservices
+- Scalable design
+- Easy horizontal scaling
 
 ## Future Roadmap
-1. Implement advanced caching strategies
-2. Add machine learning-based anomaly detection
-3. Develop more sophisticated agent workflows
-4. Enhance multi-repository support
-5. Implement advanced security scanning
+1. Multi-repository support
+2. Advanced machine learning models
+3. Customizable resolution strategies
+4. Comprehensive logging and analytics
 
-## Cost and Resource Management
-- Fully open-source infrastructure
-- Pay only for Anthropic API usage
-- Minimal cloud resource requirements
-- Horizontal scaling potential
+## Estimated Deployment Time
+- Initial setup: 6-8 hours
+- Haystack pipeline configuration: 8-12 hours
+- Testing and refinement: 4-6 hours
 
 ## Continuous Improvement
 - Regular dependency updates
-- Security patch monitoring
 - Performance benchmarking
 - Community feedback integration
-
-## Rollback and Recovery
-- Keep configuration in version control
-- Maintain regular backups of Cipher memory layer
-- Use Temporal for workflow resumability
