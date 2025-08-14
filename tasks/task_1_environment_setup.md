@@ -24,19 +24,20 @@ source ai_agent_env/bin/activate
 ### 2. Install Core Dependencies
 ```bash
 # Upgrade pip to latest version
-pip install --upgrade pip
+pip install --upgrade pip setuptools wheel
 
-# Install comprehensive dependencies
+# Install Pydantic and settings management first
+pip install pydantic pydantic-settings python-dotenv
+
+# Install core dependencies with careful dependency management
 pip install \
-    fastapi uvicorn redis celery \
-    langchain langgraph temporalio \
-    anthropic github pygithub \
-    pydantic prometheus_client \
-    opentelemetry-api opentelemetry-sdk \
-    slowapi httpx \
-    pytest pytest-asyncio \
-    httpx-oauth \
-    python-dotenv
+    fastapi \
+    langchain \
+    anthropic \
+    pydantic-settings \
+    prometheus_client \
+    opentelemetry-api \
+    pytest pytest-asyncio
 ```
 
 ### 3. Create Project Structure
@@ -107,7 +108,8 @@ EOL
 ### 5. Create Basic Configuration File
 ```python
 # github-issue-resolver/config/settings.py
-from pydantic import BaseSettings, SecretStr
+from pydantic import Field, SecretStr, ConfigDict
+from pydantic_settings import BaseSettings
 from functools import lru_cache
 
 class Settings(BaseSettings):
@@ -119,9 +121,7 @@ class Settings(BaseSettings):
     
     WEBHOOK_SECRET: SecretStr
     
-    class Config:
-        env_file = '.env'
-        env_file_encoding = 'utf-8'
+    model_config = ConfigDict(env_file='.env', env_file_encoding='utf-8')
 
 @lru_cache()
 def get_settings():
@@ -138,6 +138,9 @@ pip list
 
 # Create a simple test to ensure configuration works
 python -c "from config.settings import get_settings; print(get_settings())"
+
+# Optional: Create requirements.txt for future reference
+pip freeze > requirements.txt
 ```
 
 ## Validation Checklist
